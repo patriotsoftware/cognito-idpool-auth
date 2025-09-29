@@ -180,9 +180,18 @@ runs:
       env:
         AUDIENCE: "${{ steps.audience.outputs.value }}"
       run: |
-        response=$(curl -sLS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE")
-        token=$(echo "$response" | jq -r ".value")
-        
+      
+        for i in {1..8}; do
+          response=$(curl -sLS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE")  
+          if echo "$response" | jq -e . >/dev/null 2>&1; then
+            token=$(echo "$response" | jq -r ".value")
+            break
+          else
+            echo "Invalid JSON from AWS CLI, retrying ($i)..."
+            sleep 2
+          fi
+        done
+
         echo "::add-mask::$token"
         
         echo "token=$token" >> "$GITHUB_OUTPUT"
