@@ -174,47 +174,60 @@ runs:
         
         echo "value=$value" >> "$GITHUB_OUTPUT"
 
-    - id: token
-      name: "Get Access Token"
-      shell: bash
-      env:
-        AUDIENCE: "${{ steps.audience.outputs.value }}"
-      run: |
-      
-        for i in {1..8}; do
-          response=$(curl -sLS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE")  
-          if echo "$response" | jq -e . >/dev/null 2>&1; then
-            token=$(echo "$response" | jq -r ".value")
-            break
-          else
-            echo "Invalid JSON from AWS CLI, retrying ($i)..."
-            sleep 2
-          fi
-        done
-
-        echo "::add-mask::$token"
-        
-        echo "token=$token" >> "$GITHUB_OUTPUT"
-
     - id: authenticate
       name: "Authenticate"
       shell: bash
       env:
+        AUDIENCE: "${{ steps.audience.outputs.value }}"
         AWS_ACCOUNT_ID: "${{ steps.aws_account_id.outputs.value }}"
         AWS_DEFAULT_REGION: "${{ steps.aws_region.outputs.value }}"
         POOL_ID: "${{ steps.cognito_identity_pool_id.outputs.value }}"
         CUSTOM_ROLE_ARN: "${{ steps.custom_role_arn.outputs.value }}"
-        ACCESS_TOKEN: "${{ steps.token.outputs.token }}"
       run: |
-        response=$(aws cognito-identity get-id --identity-pool-id "$POOL_ID" --account-id "$AWS_ACCOUNT_ID" --logins '{"token.actions.githubusercontent.com":"'"$ACCESS_TOKEN"'"}')
-        identityId=$(echo $response | jq -rc '.IdentityId')
+        # GitHub's OIDC token endpoint occasionally refuses connections, returns an error body, or issues a
+        # token Cognito rejects, for a few seconds at a time. This shell runs with -e, so a failing command
+        # substitution would end the step on the first try; every call that may fail is tested explicitly.
 
-        if [ ! -z "$CUSTOM_ROLE_ARN" ]; then
-          awsCredentials=$(aws cognito-identity get-credentials-for-identity --identity-id "$identityId" --logins '{"token.actions.githubusercontent.com":"'"$ACCESS_TOKEN"'"}' --custom-role-arn "$CUSTOM_ROLE_ARN")
-        else
-          awsCredentials=$(aws cognito-identity get-credentials-for-identity --identity-id "$identityId" --logins '{"token.actions.githubusercontent.com":"'"$ACCESS_TOKEN"'"}')
-        fi
-        
+        fetch_token() {
+          local i response token
+          for i in {1..8}; do
+            if response=$(curl -sSL --fail --max-time 15 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE") \
+              && token=$(echo "$response" | jq -er '.value | select(type == "string" and length > 0)'); then
+              echo "$token"
+              return 0
+            fi
+            echo "Could not get an OIDC token from GitHub, retrying ($i/8)..." >&2
+            sleep $((i * 2))
+          done
+          echo "Could not get an OIDC token from GitHub after 8 tries" >&2
+          return 1
+        }
+
+        # A freshly issued token is sometimes rejected by Cognito ("Not a valid OpenId Connect identity token");
+        # fetching a new token and trying again gets past it.
+        for attempt in 1 2 3; do
+          token=$(fetch_token)
+          echo "::add-mask::$token"
+          logins='{"token.actions.githubusercontent.com":"'"$token"'"}'
+
+          if response=$(aws cognito-identity get-id --identity-pool-id "$POOL_ID" --account-id "$AWS_ACCOUNT_ID" --logins "$logins") \
+            && identityId=$(echo "$response" | jq -er '.IdentityId') \
+            && if [ -n "$CUSTOM_ROLE_ARN" ]; then
+                 awsCredentials=$(aws cognito-identity get-credentials-for-identity --identity-id "$identityId" --logins "$logins" --custom-role-arn "$CUSTOM_ROLE_ARN")
+               else
+                 awsCredentials=$(aws cognito-identity get-credentials-for-identity --identity-id "$identityId" --logins "$logins")
+               fi; then
+            break
+          fi
+
+          if [ "$attempt" -eq 3 ]; then
+            echo "Cognito did not accept the GitHub OIDC token after 3 tries" >&2
+            exit 1
+          fi
+          echo "Cognito authentication failed, fetching a new token and retrying ($attempt/3)..." >&2
+          sleep 5
+        done
+
         awsAccessKeyId=$(echo "$awsCredentials" | jq -r ".Credentials.AccessKeyId")
         awsSecretAccessKey=$(echo "$awsCredentials" | jq -r ".Credentials.SecretKey")
         awsSessionToken=$(echo "$awsCredentials" | jq -r ".Credentials.SessionToken")
